@@ -25,3 +25,6 @@ video_download_methods.json
 
 # OS cruft
 .DS_Store
+tiktok_scrape_*.py
+/video_mp4s_500
+/video_mp4s_500_again

@@ -8,7 +8,7 @@ Designed to run unattended on a Linux server over a large ID list (~400k):
 
   * Cookies are loaded from an exported JSON file (export_cookies.py), so NO
     locally logged-in browser is required on the server.
-  * A SQLite ledger makes the job RESUMABLE: re-running skips videos already
+  * A DuckDB ledger makes the job RESUMABLE: re-running skips videos already
     marked 'success' and (optionally) retries previous failures.
   * Worker count, paths, and behaviour are configurable via CLI flags.
   * Output is sharded into subdirectories to avoid ~400k files in one folder.
@@ -22,7 +22,7 @@ Usage (typical server run):
         --video-ids video_ids_to_reprocess.txt \
         --cookies tiktok_cookies.json \
         --output-dir video_mp4s \
-        --db video_downloads.db \
+        --db video_downloads.duckdb \
         --workers 16
 """
 
@@ -32,7 +32,6 @@ import logging
 import os
 import platform
 import shutil
-import sqlite3
 import sys
 import threading
 import time
@@ -40,14 +39,16 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
-import requests
 import pyktok as pyk
+import requests
+from playwright.sync_api import sync_playwright
+
 # The `cookies` global that pyktok uses for its HTTP requests lives in the
 # pyktok.pyktok submodule, NOT the package namespace, so we set it there.
 from pyktok import pyktok as _pyk_core
-from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
 LOG = logging.getLogger("tiktok_scraper")
@@ -64,8 +65,8 @@ URL_TEMPLATE = "https://www.tiktok.com/@tiktok/video/{}"
 class Config:
     output_dir = Path("video_mp4s")
     shard = True
-    cookies_pw = []          # Playwright-shaped cookie dicts
-    run_id = "run"           # unique per process; namespaces per-worker CSVs
+    cookies_pw = []  # Playwright-shaped cookie dicts
+    run_id = "run"  # unique per process; namespaces per-worker CSVs
     max_retries = 3
     base_delay = 1.0
 
@@ -361,7 +362,7 @@ def _save_video(video_id):
     dest = _video_path(video_id)
 
     # Resume safety: if the file is already on disk (e.g. the process died after
-    # download but before the DB commit), don't re-fetch it.
+    # download but before the DB write), don't re-fetch it.
     if dest.exists() and dest.stat().st_size > 0:
         return "cached"
 
@@ -399,10 +400,10 @@ def _save_video(video_id):
 
 
 # ---------------------------------------------------------------------------
-# Database (resumable ledger)
+# Database (resumable ledger) — DuckDB.
 # ---------------------------------------------------------------------------
 def init_db(db_path, candidate_ids):
-    conn = sqlite3.connect(db_path)
+    conn = duckdb.connect(str(db_path))
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS downloads (
@@ -415,11 +416,13 @@ def init_db(db_path, candidate_ids):
     )
     # INSERT OR IGNORE (not REPLACE): registers any new IDs as 'pending' while
     # PRESERVING the status of videos already attempted in a previous run.
-    conn.executemany(
-        "INSERT OR IGNORE INTO downloads (video_id, status) VALUES (?, 'pending')",
-        [(str(v),) for v in candidate_ids],
+    ids_df = pd.DataFrame({"video_id": [str(v) for v in candidate_ids]})
+    conn.register("candidate_ids_df", ids_df)
+    conn.execute(
+        "INSERT OR IGNORE INTO downloads (video_id, status) "
+        "SELECT DISTINCT video_id, 'pending' FROM candidate_ids_df"
     )
-    conn.commit()
+    conn.unregister("candidate_ids_df")
     return conn
 
 
@@ -453,7 +456,11 @@ def consolidate_metadata(conn):
     if "video_id" in videos_info.columns:
         videos_info = videos_info.drop_duplicates(subset="video_id", keep="last")
     videos_info.to_csv("videos_info.csv", index=False)
-    videos_info.to_sql("videos_info", conn, if_exists="replace", index=False)
+    # DuckDB can create a table straight from a registered DataFrame
+    # (pandas' to_sql doesn't speak DuckDB connections).
+    conn.register("videos_info_df", videos_info)
+    conn.execute("CREATE OR REPLACE TABLE videos_info AS SELECT * FROM videos_info_df")
+    conn.unregister("videos_info_df")
     LOG.info("Consolidated metadata for %d videos -> videos_info.csv", len(videos_info))
 
 
@@ -464,34 +471,72 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bulk TikTok video downloader (pyktok + Playwright fallback)."
     )
-    p.add_argument("--video-ids", default="video_ids_to_reprocess.txt",
-                   help="Path to newline-delimited file of TikTok video IDs.")
-    p.add_argument("--cookies", default="tiktok_cookies.json",
-                   help="Path to exported TikTok cookies JSON (see export_cookies.py).")
-    p.add_argument("--output-dir", default="video_mp4s",
-                   help="Directory to write .mp4 files into.")
-    p.add_argument("--db", default="video_downloads.db",
-                   help="SQLite ledger path (enables resuming).")
-    p.add_argument("--workers", type=int, default=16,
-                   help="Number of concurrent download workers. See README on tuning; "
-                        "this is I/O- and browser-bound, so it is NOT one-per-core.")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Only consider this many IDs (for testing). Default: all.")
-    p.add_argument("--seed", type=int, default=1,
-                   help="Random seed used when --limit takes a random subset.")
-    p.add_argument("--random-subset", action="store_true",
-                   help="With --limit, pick a random subset (default takes the first N).")
-    p.add_argument("--retry-failures", action="store_true",
-                   help="Also re-attempt videos previously marked 'failure'.")
-    p.add_argument("--flat", action="store_true",
-                   help="Write all .mp4s into one directory (no sharding). "
-                        "Not recommended for ~400k files.")
-    p.add_argument("--max-retries", type=int, default=3,
-                   help="Per-video retry attempts before giving up.")
-    p.add_argument("--log-file", default="scrape.log",
-                   help="Path to the run log file.")
-    p.add_argument("--no-progress", action="store_true",
-                   help="Disable the tqdm progress bar (cleaner for nohup/logs).")
+    p.add_argument(
+        "--video-ids",
+        default="video_ids_to_reprocess.txt",
+        help="Path to newline-delimited file of TikTok video IDs.",
+    )
+    p.add_argument(
+        "--cookies",
+        default="tiktok_cookies.json",
+        help="Path to exported TikTok cookies JSON (see export_cookies.py).",
+    )
+    p.add_argument(
+        "--output-dir", default="video_mp4s", help="Directory to write .mp4 files into."
+    )
+    p.add_argument(
+        "--db",
+        default="video_downloads.duckdb",
+        help="DuckDB ledger path (enables resuming). NOTE: a .db file "
+        "from the old SQLite version is NOT compatible; see README.",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of concurrent download workers. See README on tuning; "
+        "this is I/O- and browser-bound, so it is NOT one-per-core.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only consider this many IDs (for testing). Default: all.",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed used when --limit takes a random subset.",
+    )
+    p.add_argument(
+        "--random-subset",
+        action="store_true",
+        help="With --limit, pick a random subset (default takes the first N).",
+    )
+    p.add_argument(
+        "--retry-failures",
+        action="store_true",
+        help="Also re-attempt videos previously marked 'failure'.",
+    )
+    p.add_argument(
+        "--flat",
+        action="store_true",
+        help="Write all .mp4s into one directory (no sharding). "
+        "Not recommended for ~400k files.",
+    )
+    p.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Per-video retry attempts before giving up.",
+    )
+    p.add_argument("--log-file", default="scrape.log", help="Path to the run log file.")
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the tqdm progress bar (cleaner for nohup/logs).",
+    )
     return p.parse_args(argv)
 
 
@@ -531,7 +576,9 @@ def main(argv=None):
             )
         else:
             video_ids = video_ids[: args.limit]
-        LOG.info("Limited to %d IDs (random_subset=%s)", len(video_ids), args.random_subset)
+        LOG.info(
+            "Limited to %d IDs (random_subset=%s)", len(video_ids), args.random_subset
+        )
 
     conn = init_db(args.db, video_ids)
     work = select_work(conn, args.retry_failures)
@@ -539,7 +586,10 @@ def main(argv=None):
     done = len(video_ids) - len(work)
     LOG.info(
         "%d already complete; %d to process with %d workers (run_id=%s)",
-        done, len(work), args.workers, CFG.run_id,
+        done,
+        len(work),
+        args.workers,
+        CFG.run_id,
     )
     if not work:
         LOG.info("Nothing to do. All videos already processed.")
@@ -569,25 +619,26 @@ def main(argv=None):
                         "UPDATE downloads SET status='failure', error=? WHERE video_id=?",
                         (str(e), video_id),
                     )
-                conn.commit()
+                # No conn.commit(): DuckDB auto-commits each statement.
         except KeyboardInterrupt:
             interrupted = True
-            LOG.warning("Interrupted — cancelling remaining work and saving progress...")
+            LOG.warning(
+                "Interrupted — cancelling remaining work and saving progress..."
+            )
             executor.shutdown(wait=False, cancel_futures=True)
 
     consolidate_metadata(conn)
 
-    # Summaries
-    summary = pd.read_sql_query(
-        "SELECT method, status, COUNT(*) AS count FROM downloads GROUP BY method, status",
-        conn,
-    )
+    # Summaries — DuckDB results convert straight to DataFrames via .df(),
+    # so pd.read_sql_query is no longer needed.
+    summary = conn.execute(
+        "SELECT method, status, COUNT(*) AS count FROM downloads GROUP BY method, status"
+    ).df()
     LOG.info("Status summary:\n%s", summary.to_string(index=False))
-    error_summary = pd.read_sql_query(
+    error_summary = conn.execute(
         "SELECT error, COUNT(*) AS n FROM downloads WHERE status='failure' "
-        "GROUP BY error ORDER BY n DESC",
-        conn,
-    )
+        "GROUP BY error ORDER BY n DESC"
+    ).df()
     if not error_summary.empty:
         LOG.info("Failure breakdown:\n%s", error_summary.to_string(index=False))
     conn.close()
