@@ -3,7 +3,7 @@
 Downloads TikTok videos by ID using [pyktok](https://github.com/dfreelon/pyktok),
 with a headless-Chromium (Playwright) fallback for videos whose direct download
 URL is blocked by anti-bot measures. Built to run unattended on a Linux server
-over a large ID list (~400k), with a resumable SQLite ledger.
+over a large ID list (~400k), with a resumable DuckDB ledger.
 
 ## Files
 
@@ -84,7 +84,7 @@ nohup uv run python tiktok_scraper.py --workers 16 --no-progress > run.out 2>&1 
 
 ### Resuming
 
-The job is resumable. Every video's outcome is recorded in the SQLite ledger
+The job is resumable. Every video's outcome is recorded in the DuckDB ledger
 (`video_downloads.db`). Re-running the **same command** skips anything already
 marked `success` and only processes what's left — so if the process dies at
 380k/423k, just start it again. Add `--retry-failures` to also re-attempt videos
