@@ -1,0 +1,16 @@
+[project]
+name = "tiktok-scrape"
+version = "0.1.0"
+description = "Bulk TikTok video downloader (pyktok + Playwright fallback), server-ready."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.59.0",
+    "pyktok>=0.0.31",
+    "tqdm>=4.67.3",
+    "yt-dlp>=2026.3.17",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "requests>=2.31",
+    "browser-cookie3>=0.19.1",
+]
