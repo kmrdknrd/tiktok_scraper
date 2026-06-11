@@ -37,16 +37,10 @@ that file to the server, and the scraper loads it for both pyktok and Playwright
    scp tiktok_cookies.json user@tux-server:/path/to/tiktok-scrape/
    ```
 
-`tiktok_cookies.json` **is your TikTok session** — treat it like a password. It
+`tiktok_cookies.json` **is the TikTok session** — treat it like a password. It
 is git-ignored by default; do not commit or share it. Cookies also expire, so
 for a multi-day run you may need to re-export and recopy partway through (the job
 is resumable, so just stop, refresh the file, and restart).
-
-> Alternative considered: a one-time interactive Playwright login *on* the server
-> to create a persistent browser profile. It avoids shipping a cookie file, but
-> needs a GUI/X display (or VNC) on the server and a manual login step per
-> machine. The export-file approach is simpler and headless-friendly, so it's the
-> default here.
 
 ## Server setup (TUX / Linux)
 
@@ -54,7 +48,8 @@ Requires Python ≥ 3.11. Using [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
 # 1. Get the code + create the venv from the lockfile
-git clone <your-repo-url> tiktok-scrape && cd tiktok-scrape
+git clone https://github.com/kmrdknrd/tiktok_scraper.git tiktok-scrape
+cd tiktok-scrape
 uv sync
 
 # 2. Install the Playwright browser AND its system libraries.
